@@ -1,0 +1,12 @@
+Flask
+PyPDF2
+PyMuPDF
+pytesseract
+Pillow
+requests
+numpy
+scikit-learn
+torch
+transformers
+opencv-python
+python-dotenv

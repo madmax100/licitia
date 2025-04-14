@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+envlicit/ # Ou o nome do seu ambiente virtual
+.env # Arquivos de variáveis de ambiente (contêm segredos)
+
+# Output
+output/
+
+# IDE specific
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*.swp
