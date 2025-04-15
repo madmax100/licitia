@@ -1,15 +1,18 @@
+import sys
 import os
-import argparse
-import json
-from pathlib import Path
-from datetime import datetime
-import subprocess  # Import subprocess module
-import sys         # Import sys module
+import argparse  # Adicionar esta linha
+import json  # Também precisamos disso para o JSON dump
+import subprocess
+from datetime import datetime  # Para o timestamp
+
+# Adiciona o diretório principal ao path
+sys.path.insert(0, os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
 
 # Import modules
 from utils.pdf_reader import PDFReader
 from utils.ocr_helper import OCRHelper
 from models.ai_processor import AIProcessor
+from src.utils.deps_helper import configure_poppler
 
 def parse_arguments():
     """Parse command line arguments."""
@@ -98,20 +101,16 @@ def check_and_pull_ollama_model(model_name, proxy_url=None, proxy_user=None, pro
 
 def analyze_pdf(pdf_path, output_dir, model_name, tesseract_path, server_url,
                proxy_url=None, proxy_user=None, proxy_password=None):
-    """Analyze PDF file and extract document information."""
-    # Create output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
-
-    # --- Check and pull Ollama model ---
+    # Substitua esta linha:
     model_available = check_and_pull_ollama_model(model_name, proxy_url, proxy_user, proxy_password)
-    # Decide whether to proceed based on model availability, or force offline mode
+    
+    # Resto do código permanece igual
     force_offline = not model_available
     if force_offline:
         print("⚠️ Proceeding in offline mode as the required model could not be pulled.")
-    # ------------------------------------
-
-    # Initialize components
-    pdf_reader = PDFReader(tesseract_path=tesseract_path)
+    
+    # Inicializa os componentes
+    pdf_reader = PDFReader(pdf_path, tesseract_path=tesseract_path)
     ocr_helper = OCRHelper(tesseract_path=tesseract_path)
     ai_processor = AIProcessor(
         model=model_name,
@@ -130,15 +129,14 @@ def analyze_pdf(pdf_path, output_dir, model_name, tesseract_path, server_url,
 
     # Extract text from PDF
     try:
-        pages_content = pdf_reader.extract_text_from_pdf(pdf_path)
+        pages_content = pdf_reader.extract_text()
         print(f"📄 Extracted text from {len(pages_content)} pages")
     except Exception as e:
         print(f"❌ Error extracting text from PDF: {e}")
         return
 
-    # Identify document boundaries
-    # Pass ai_processor only if not in forced offline mode
-    documents = pdf_reader.identify_document_boundaries(pages_content, ai_processor if not force_offline else None)
+    # Identify document boundaries inteligentemente
+    documents = pdf_reader.identify_document_boundaries(pages_content, ai_processor)
     print(f"📑 Identified {len(documents)} documents in the PDF")
 
     # Process each document
@@ -146,21 +144,19 @@ def analyze_pdf(pdf_path, output_dir, model_name, tesseract_path, server_url,
 
     for i, doc in enumerate(documents):
         print(f"\n📝 Processing document {i+1} of {len(documents)}...")
-        start_page = doc["start_page"] + 1  # 1-indexed for display
-        end_page = doc["end_page"] + 1      # 1-indexed for display
-
-        # Combine text from all pages of the document
-        full_text = "\n".join([page["text"] for page in doc["pages"]])
-
-        # Process with AI (or offline fallback within AIProcessor)
-        metadata = ai_processor.process_document(full_text)
-
-        # If AI couldn't extract a date, try OCR helper
-        if metadata["date"] == "Data não identificada" or not metadata["date"]:
-            extracted_date = ocr_helper.extract_date(full_text)
-            if extracted_date:
-                metadata["date"] = extracted_date
-
+        start_page = doc["start_page"]
+        end_page = doc["end_page"]
+        
+        # Combine all pages of this document
+        doc_text = "\n\n".join(doc["pages_content"])
+        
+        # Get metadata using AI or fallback
+        try:
+            metadata = ai_processor.process_document(doc_text)
+        except Exception as e:
+            print(f"❌ Error processing document with AI: {e}")
+            metadata = {"title": f"Document {i+1}", "summary": "Error processing", "date": None}
+        
         # Create result
         result = {
             "document_id": i + 1,
@@ -171,7 +167,11 @@ def analyze_pdf(pdf_path, output_dir, model_name, tesseract_path, server_url,
             "date": metadata["date"],
             "page_count": end_page - start_page + 1
         }
-
+        
+        # Add values if they exist
+        if doc.get("values") or metadata.get("valores"):
+            result["values"] = doc.get("values") or metadata.get("valores")
+        
         results.append(result)
         print(f"✅ Processed document: {result['title']}")
 
@@ -186,7 +186,14 @@ def analyze_pdf(pdf_path, output_dir, model_name, tesseract_path, server_url,
     print(f"\n💾 Results saved to: {output_file}")
 
 def main():
-    """Main function."""
+    # Configura o Poppler explicitamente com o caminho fornecido
+    poppler_path = r"C:\Users\Cirilo\Downloads\Release-24.08.0-0\poppler-24.08.0\Library\bin"
+    
+    if os.path.exists(poppler_path):
+        print(f"✅ Adicionando Poppler ao PATH: {poppler_path}")
+        os.environ['PATH'] = poppler_path + os.pathsep + os.environ['PATH']
+    
+    # Continua com o código existente
     args = parse_arguments()
     analyze_pdf(
         args.pdf,

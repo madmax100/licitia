@@ -1,250 +1,231 @@
 import requests
-import json
 import re
-import base64
-from datetime import datetime
-from PIL import Image
-import io
-import os
+import json
+from functools import lru_cache
 
 class AIProcessor:
-    def __init__(self, model="llava", server_url="http://localhost:11434", 
-                 proxy_url=None, proxy_user=None, proxy_password=None):
+    def __init__(self, model, server_url, proxy_url=None, proxy_user=None, proxy_password=None):
         """
-        Initialize the AI processor with offline mode by default.
+        Inicializa o processador de AI.
         
         Args:
-            model (str): The name of the Ollama model to use
-            server_url (str): URL of the Ollama server
-            proxy_url (str, optional): Proxy URL (e.g., http://proxy.example.com:8080)
-            proxy_user (str, optional): Username for proxy authentication
-            proxy_password (str, optional): Password for proxy authentication
+            model (str): Nome do modelo a ser usado (llava, mistral, etc.)
+            server_url (str): URL do servidor Ollama
         """
         self.model = model
         self.server_url = server_url
-        self.offline_mode = True  # Set to True by default
+        self.proxy_url = proxy_url
+        self.proxy_user = proxy_user
+        self.proxy_password = proxy_password
+        self.offline_mode = False
+        self.chunk_size = 1000  # Tamanho dos chunks para processamento
+
+    def process_document(self, text):
+        print(f"🤖 Tentando processar com o modelo {self.model} (todas as partes)...")
         
-        # Configure proxy settings
-        self.proxies = {}
-        if proxy_url:
-            proxy_auth = ""
-            if proxy_user and proxy_password:
-                proxy_auth = f"{proxy_user}:{proxy_password}@"
-                
-            proxy_with_auth = proxy_url.replace("://", f"://{proxy_auth}")
-            self.proxies = {
-                "http": proxy_with_auth,
-                "https": proxy_with_auth
-            }
-        
-        # Detect if we should try to use Ollama or stay offline
-        try:
-            # Test if server is reachable - simple GET request
-            response = requests.get(
-                f"{self.server_url}", 
-                proxies=self.proxies,
-                timeout=2
-            )
-            
-            if response.status_code == 200:
-                self.offline_mode = False
-                print("Ollama server detectado, tentando usar modelos de IA.")
-        except Exception as e:
-            print(f"Ollama server não está acessível: {e}. Usando processamento offline.")
-    
-    def _call_ollama(self, prompt, system_prompt=None, image_path=None):
-        """
-        Call the Ollama API or use offline processing.
-        """
-        # If offline mode is enabled, skip API call and use fallback
         if self.offline_mode:
-            return ""
-            
-        # Otherwise try to call the API
-        url = f"{self.server_url}/api/generate"
-        data = {
-            "model": self.model,
-            "prompt": prompt,
-            "stream": False
-        }
+            print("⚠️ Modo offline ativado. Usando processamento local.")
+            return self._local_fallback_processing(text)
         
-        if system_prompt:
-            data["system"] = system_prompt
-            
-        # Add image if provided
-        if image_path:
+        # Dividir o texto em partes menores
+        chunks = self._split_text_into_chunks(text)
+        print(f"🔄 Documento dividido em {len(chunks)} partes para processamento completo")
+        
+        # Processar cada parte usando o modelo
+        titles = []
+        summary_parts = []
+        dates = []
+        valores = []
+        
+        for i, chunk in enumerate(chunks):
+            print(f"  🔍 Processando parte {i+1}/{len(chunks)}...")
+            # Processar cada parte com timeout estendido
             try:
-                with open(image_path, "rb") as image_file:
-                    image_data = image_file.read()
-                    base64_image = base64.b64encode(image_data).decode("utf-8")
-                    data["images"] = [base64_image]
-            except Exception as e:
-                print(f"Error processing image: {e}")
+                url = f"{self.server_url}/api/generate"
+                
+                prompt_text = f"""Extraia as seguintes informações desta parte do documento:
+
+{chunk}
+
+Retorne um JSON com os campos:
+title (título do documento),
+summary (resumo do conteúdo),
+date (data do documento, se houver),
+valor (valor monetário mencionado, se houver)"""
+                
+                payload = {
+                    "model": self.model,
+                    "prompt": prompt_text,
+                    "stream": False
+                }
+                
+                print(f"  ⏳ Enviando solicitação ao modelo {self.model} para parte {i+1} (timeout: 300s)...")
+                response = requests.post(url, json=payload, timeout=300)
+                response.raise_for_status()
+                
+                result = response.json()
+                print(f"  ✅ Resposta recebida do modelo {self.model} para parte {i+1}!")
+                
+                try:
+                    ai_response = result.get("response", "{}")
+                    # Procura por um bloco JSON válido na resposta
+                    json_match = re.search(r'({.*})', ai_response.replace('\n', ' '), re.DOTALL)
+                    if json_match:
+                        ai_response = json_match.group(1)
+                    
+                    metadata = json.loads(ai_response)
+                    
+                    if metadata.get("title"):
+                        titles.append(metadata.get("title"))
+                    if metadata.get("summary"):
+                        summary_parts.append(metadata.get("summary"))
+                    if metadata.get("date"):
+                        dates.append(metadata.get("date"))
+                    if metadata.get("valor"):
+                        valores.append(metadata.get("valor"))
+                        
+                except json.JSONDecodeError:
+                    print(f"  ⚠️ Não foi possível analisar a resposta da parte {i+1} como JSON. Usando processamento local.")
+                    local_result = self._local_fallback_processing(chunk)
+                    if local_result.get("title"):
+                        titles.append(local_result.get("title"))
+                    if local_result.get("summary"):
+                        summary_parts.append(local_result.get("summary"))
+                    if local_result.get("date"):
+                        dates.append(local_result.get("date"))
+                
+            except requests.exceptions.Timeout:
+                print(f"  ⚠️ Timeout ao processar parte {i+1} com {self.model}. Usando processamento local.")
+                local_result = self._local_fallback_processing(chunk)
+                if local_result.get("title"):
+                    titles.append(local_result.get("title"))
+                if local_result.get("summary"):
+                    summary_parts.append(local_result.get("summary"))
+                if local_result.get("date"):
+                    dates.append(local_result.get("date"))
+                    
+            except requests.exceptions.RequestException as e:
+                print(f"  ⚠️ Erro na API ao processar parte {i+1} com {self.model}: {e}. Usando processamento local.")
+                local_result = self._local_fallback_processing(chunk)
+                if local_result.get("title"):
+                    titles.append(local_result.get("title"))
+                if local_result.get("summary"):
+                    summary_parts.append(local_result.get("summary"))
+                if local_result.get("date"):
+                    dates.append(local_result.get("date"))
         
-        try:
-            # Also use proxy settings from environment variables if available
-            proxies = self.proxies.copy()
-            if "HTTP_PROXY" in os.environ and not proxies.get("http"):
-                proxies["http"] = os.environ["HTTP_PROXY"]
-            if "HTTPS_PROXY" in os.environ and not proxies.get("https"):
-                proxies["https"] = os.environ["HTTPS_PROXY"]
-            
-            response = requests.post(
-                url, 
-                json=data, 
-                proxies=proxies,
-                timeout=5
-            )
-            response.raise_for_status()
-            return response.json().get("response", "")
-        except Exception as e:
-            print(f"Error calling Ollama API: {e}")
-            return ""
-    
-    def process_document(self, extracted_text):
-        """
-        Process document text to extract metadata.
+        # Consolidar os resultados
+        best_title = self._select_best_title(titles) if titles else "Documento sem título"
+        combined_summary = " ".join(summary_parts) if summary_parts else "Resumo não disponível"
+        best_date = self._select_best_date(dates) if dates else None
         
-        Args:
-            extracted_text (str): The extracted text from the document
-            
-        Returns:
-            dict: Dictionary containing title, summary, date
-        """
-        title = self.extract_title(extracted_text)
-        summary = self.summarize_text(extracted_text)
-        date = self.extract_date(extracted_text)
+        print(f"  ✅ Processamento concluído de todas as {len(chunks)} partes do documento")
         
         return {
-            "title": title,
-            "summary": summary,
-            "date": date
+            "title": best_title,
+            "summary": combined_summary,
+            "date": best_date,
+            "valores": valores if valores else None
         }
     
-    def is_new_document_page(self, page_image_path, page_text):
-        """
-        Determine if a page likely starts a new document using the Llava model.
+    def _split_text_into_chunks(self, text):
+        """Divide o texto em chunks menores para processamento."""
+        # Se o texto for pequeno o suficiente, retorne-o como está
+        if len(text) <= self.chunk_size:
+            return [text]
         
-        Args:
-            page_image_path (str): Path to the page image
-            page_text (str): Text extracted from the page
-            
-        Returns:
-            bool: True if the page likely starts a new document
-        """
-        prompt = """
-        Analyze this page and determine if it appears to be the start of a new document.
-        Look for title pages, cover pages, new headers, or other indicators that this is 
-        the first page of a document rather than a continuation page.
-        Answer with only "YES" if this is likely the start of a new document, or "NO" if it's a continuation page.
-        """
+        # Dividir por parágrafos para manter a coerência
+        paragraphs = re.split(r'\n\s*\n', text)
+        chunks = []
+        current_chunk = ""
         
-        response = self._call_ollama(prompt, image_path=page_image_path)
+        for paragraph in paragraphs:
+            # Se adicionar este parágrafo exceder o tamanho do chunk, inicie um novo
+            if len(current_chunk) + len(paragraph) > self.chunk_size:
+                if current_chunk:  # Não adicione chunks vazios
+                    chunks.append(current_chunk)
+                current_chunk = paragraph
+            else:
+                if current_chunk:
+                    current_chunk += "\n\n" + paragraph
+                else:
+                    current_chunk = paragraph
         
-        # If Ollama response fails, fallback to simple heuristics
-        if not response or "Error" in response:
-            # Check if page contains elements that suggest it's a first page
-            first_lines = page_text.strip().split('\n')[:5]
-            first_text = ' '.join(first_lines).lower()
+        # Adicione o último chunk se não estiver vazio
+        if current_chunk:
+            chunks.append(current_chunk)
             
-            # Check for common first page indicators
-            indicators = ['termo', 'relatório', 'laudo', 'auto', 'ofício', 'memorando', 
-                         'processo', 'parecer', 'despacho', 'decisão']
-            
-            for indicator in indicators:
-                if indicator.lower() in first_text:
-                    return True
-                    
-            # First page often has less text
-            if len(page_text.strip()) < 300:
-                return True
+        return chunks
+    
+    def _local_fallback_processing(self, text):
+        """Processamento local simples baseado em regras quando a IA falha."""
+        # Extrair título (primeiras linhas não vazias)
+        lines = [line.strip() for line in text.split('\n') if line.strip()]
+        title = lines[0] if lines else "Documento"
+        
+        # Resumo (primeiros 200 caracteres)
+        summary = text[:200] + "..." if len(text) > 200 else text
+        
+        # Tentar extrair data com regex
+        date_patterns = [
+            r'\b(\d{1,2})[/.-](\d{1,2})[/.-](\d{2,4})\b',  # DD/MM/YYYY
+            r'\b(\d{2,4})[/.-](\d{1,2})[/.-](\d{1,2})\b',   # YYYY/MM/DD
+            r'\b(\d{1,2})\s+de\s+(janeiro|fevereiro|março|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\s+de\s+(\d{4})\b'  # DD de Mês de YYYY
+        ]
+        
+        date = None
+        for pattern in date_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            if matches:
+                if isinstance(matches[0], tuple):
+                    date = "/".join(matches[0])
+                else:
+                    date = matches[0]
+                break
                 
-            return False
+        # Extrair valores monetários
+        value_pattern = r'R\$\s*[\d\.,]+|\d+[\.,]\d+\s*reais|\d+[\.,]\d+\s*mil reais|\d+[\.,]\d+\s*milhões'
+        values = re.findall(value_pattern, text, re.IGNORECASE)
         
-        return "YES" in response.upper()
+        return {
+            "title": title, 
+            "summary": summary, 
+            "date": date,
+            "valores": values if values else None
+        }
     
-    def extract_title(self, text):
-        """
-        Extract the title from the document text.
-        """
-        prompt = f"""
-        Extract the main title or document type from the following text. 
-        Give only the title, without any additional text:
+    def _select_best_title(self, titles):
+        """Seleciona o melhor título das partes processadas."""
+        if not titles:
+            return "Documento sem título"
         
-        {text[:1000]}
-        """
-        
-        response = self._call_ollama(prompt)
-        
-        if not response:
-            # Fallback to simple heuristics
-            lines = text.split('\n')
-            candidate_lines = [line.strip() for line in lines[:10] if line.strip()]
+        # Estratégia: selecionar o título mais longo e informativo
+        # Exclui títulos que são simplesmente comandos do prompt
+        filtered_titles = [t for t in titles if not t.startswith("Extraia as seguintes")]
+        if not filtered_titles:
+            return titles[0]
             
-            if candidate_lines:
-                # Select the line most likely to be a title (short but not too short)
-                for line in candidate_lines:
-                    if 5 < len(line) < 100:
-                        return line
-                        
-            return "Documento sem título identificado"
-            
-        return response.strip()
+        # Ordenar por comprimento, excluindo aqueles muito curtos
+        substantial_titles = [t for t in filtered_titles if len(t) > 5]
+        if substantial_titles:
+            return sorted(substantial_titles, key=lambda x: len(x), reverse=True)[0]
+        else:
+            return filtered_titles[0]
     
-    def summarize_text(self, text):
-        """
-        Summarize the document text.
-        """
-        prompt = f"""
-        Create a concise summary (maximum 3 paragraphs) of the following document:
+    def _select_best_date(self, dates):
+        """Seleciona a data mais provável das partes processadas."""
+        if not dates:
+            return None
         
-        {text[:3000]}
-        """
+        # Estratégia: retornar a data que aparece com mais frequência
+        date_count = {}
+        for date in dates:
+            if date:  # Ignora None ou string vazia
+                date_count[date] = date_count.get(date, 0) + 1
         
-        response = self._call_ollama(prompt)
-        
-        if not response:
-            # Fallback to simple extraction
-            paragraphs = text.split('\n\n')
-            relevant_paragraphs = [p for p in paragraphs[:5] if len(p.strip()) > 50]
+        if not date_count:
+            return None
             
-            if relevant_paragraphs:
-                summary = "\n".join(relevant_paragraphs[:3])
-                if len(summary) > 500:
-                    summary = summary[:500] + "..."
-                return summary
-                    
-            return "Extrato do documento: " + text[:500] + "..."
-            
-        return response.strip()
-    
-    def extract_date(self, text):
-        """
-        Extract the date from the document text.
-        """
-        prompt = f"""
-        Extract the date of creation or issue date from the following document text.
-        Return just the date in DD/MM/YYYY format. If no date is found, return "Date not found".
-        
-        {text[:2000]}
-        """
-        
-        response = self._call_ollama(prompt)
-        
-        if not response or "not found" in response.lower():
-            # Fallback to regex extraction
-            date_patterns = [
-                r'\b(\d{1,2})[/.-](\d{1,2})[/.-](\d{2,4})\b',  # DD/MM/YYYY
-                r'\b(\d{1,2}) de (\w+) de (\d{2,4})\b',        # DD de Mês de YYYY
-            ]
-            
-            for pattern in date_patterns:
-                matches = re.findall(pattern, text[:1000])
-                if matches:
-                    # Process the first match
-                    match = matches[0]
-                    return f"{match[0]}/{match[1]}/{match[2]}"
-                    
-            return "Data não identificada"
-            
-        return response.strip()
+        # Ordenar por frequência e retornar a mais comum
+        sorted_dates = sorted(date_count.items(), key=lambda x: x[1], reverse=True)
+        return sorted_dates[0][0]
