@@ -468,105 +468,263 @@ class PDFReader:
             else:
                 raise Exception(f"pdfplumber failed and no valid text was extracted: {e}")
 
-    def identify_document_boundaries(self, pages_content, ai_processor=None):
+    def identify_document_boundaries(self, pages_content=None, ai_processor=None):
         """
-        Identifica os limites de cada documento no PDF usando o modelo de IA,
-        já extraindo resumo, data e valores de cada página.
+        Identifica os limites de cada documento no PDF processando cada página individualmente.
+        O fluxo tenta extrair texto e identificar documentos página por página.
         """
-        print("🔍 Identificando limites de documentos no PDF (usando IA página por página)...")
+        print("\n🔍 INICIANDO PROCESSAMENTO PÁGINA A PÁGINA...")
+        print("=" * 80)
 
         documents = []
         current_doc_pages = []
         current_doc_start = 0
+        current_doc_titles = []
         current_doc_resumos = []
         current_doc_datas = []
         current_doc_valores = []
-
-        # Prompt para o modelo decidir se é início de novo documento e extrair informações
+        
+        # Prompt para o modelo principal
         boundary_prompt = PromptTemplate(
             input_variables=["text"],
             template=(
                 "O texto a seguir foi extraído de uma página de um PDF.\n"
                 "1. Responda apenas com 'SIM' se esta página é o INÍCIO de um novo documento, ou 'NÃO' caso contrário.\n"
-                "2. Extraia um resumo curto do conteúdo da página.\n"
+                "2. Extraia um título e um resumo curto do conteúdo da página.\n"
                 "3. Se houver, extraia a data principal e valores monetários.\n"
                 "Responda no formato JSON:\n"
-                "{\n"
+                "{{\n"
                 "  \"novo_documento\": \"SIM\" ou \"NÃO\",\n"
+                "  \"titulo\": \"...\",\n"
                 "  \"resumo\": \"...\",\n"
                 "  \"data\": \"...\",\n"
                 "  \"valores\": [ ... ]\n"
-                "}\n"
+                "}}\n"
                 "Texto:\n{text}\n"
                 "Resposta:"
             )
         )
         chain = boundary_prompt | self.llm
-
-        for i, page_content in enumerate(pages_content):
+        
+        # Determinar número total de páginas
+        with pdfplumber.open(self.pdf_path) as pdf:
+            total_pages = len(pdf.pages)
+        
+        print(f"📄 Total de páginas no PDF: {total_pages}")
+        print("=" * 80)
+        
+        # Processar cada página individualmente
+        for page_number in range(1, total_pages + 1):
+            print(f"\n📄 PÁGINA {page_number}/{total_pages} - INICIANDO PROCESSAMENTO")
+            print("-" * 80)
+            page_text = ""
+            extraction_method = "none"
+            
+            # ETAPA 1: EXTRAÇÃO DE TEXTO
+            print(f"⚙️ ETAPA 1: Tentando extrair texto da página {page_number}...")
+            
+            # 1.1. Tenta extrair com pdfplumber
+            try:
+                print(f"  ➤ Tentando extração com pdfplumber...")
+                with pdfplumber.open(self.pdf_path) as pdf:
+                    page = pdf.pages[page_number - 1]
+                    page_text = page.extract_text(x_tolerance=3, y_tolerance=3) or ""
+                    if page_text.strip():
+                        extraction_method = "pdfplumber"
+                        print(f"  ✅ Texto extraído com pdfplumber ({len(page_text)} caracteres)")
+                    else:
+                        print(f"  ⚠️ pdfplumber extraiu texto vazio ou apenas espaços")
+            except Exception as e:
+                print(f"  ❌ Erro ao extrair texto com pdfplumber: {e}")
+                page_text = ""
+            
+            # 1.2. Se pdfplumber falhou, tenta OCR com Tesseract
+            if not page_text.strip():
+                try:
+                    print(f"  ➤ Tentando extrair texto com OCR/Tesseract...")
+                    images = convert_from_path(
+                        self.pdf_path, 
+                        first_page=page_number,
+                        last_page=page_number
+                    )
+                    if images:
+                        page_text = pytesseract.image_to_string(images[0], lang='por')
+                        if page_text.strip():
+                            extraction_method = "ocr"
+                            print(f"  ✅ Texto extraído com OCR ({len(page_text)} caracteres)")
+                        else:
+                            print(f"  ⚠️ OCR extraiu texto vazio ou apenas espaços")
+                    else:
+                        print(f"  ⚠️ Não foi possível converter a página em imagem")
+                except Exception as e:
+                    print(f"  ❌ OCR falhou: {e}")
+                    page_text = ""
+            
+            # 1.3. Se não conseguiu extrair texto, continua para próxima página
+            if not page_text.strip():
+                print(f"  ⚠️ Não foi possível extrair texto da página {page_number} - pulando para próxima")
+                # Adiciona página vazia para manter a contagem correta
+                current_doc_pages.append("")
+                current_doc_titles.append("")
+                current_doc_resumos.append("")
+                current_doc_datas.append("")
+                current_doc_valores.append([])
+                continue
+            
+            # ETAPA 2: ENVIO DO TEXTO PARA O MODELO DE IA
+            print(f"⚙️ ETAPA 2: Enviando texto para o modelo de IA...")
             is_new_doc = False
-            page_number = i + 1
+            titulo = ""
             resumo = ""
             data = ""
             valores = []
+            use_tesseract = False
 
-            # Sempre novo documento na primeira página
-            if i == 0:
-                is_new_doc = True
-                print(f"  📄 Página {page_number}: Início do primeiro documento")
-            else:
-                # Usa o modelo para decidir e extrair informações
-                try:
-                    resposta = chain.invoke({"text": page_content})
+            try:
+                print(f"  ➤ Enviando texto para o modelo {self.llm.model}...")
+                resposta = chain.invoke({"text": page_text})
+                
+                # Verificar se a resposta tem formato JSON e informações válidas
+                if resposta and resposta.strip().startswith("{"):
+                    print(f"  ✅ Resposta recebida em formato JSON")
+                    print(f"  📝 Resposta: {resposta.strip()[:80]}...")
+                    
                     info = json.loads(resposta)
                     is_new_doc = info.get("novo_documento", "").strip().upper().startswith("SIM")
+                    titulo = info.get("titulo", "")
                     resumo = info.get("resumo", "")
                     data = info.get("data")
                     valores = info.get("valores", [])
-                except Exception as e:
-                    print(f"⚠️ Erro ao consultar IA ou interpretar resposta na página {page_number}: {e}")
-                    # fallback simples
-                    is_new_doc = self._is_document_break(page_content)
-                    resumo = ""
-                    data = ""
-                    valores = []
+                    
+                    # IMPORTANTE: Verificar se o texto foi suficiente para o modelo extrair informações úteis
+                    if (not titulo or titulo.lower() in ["", "documento sem título", "não especificado"]) and extraction_method == "pdfplumber":
+                        print(f"  ⚠️ Modelo não conseguiu extrair título com pdfplumber, tentando com OCR/Tesseract...")
+                        use_tesseract = True
+                else:
+                    print(f"  ⚠️ Resposta da IA não é JSON válido")
+                    print(f"  📝 Resposta bruta: {resposta[:50]}...")
+                    
+                    if extraction_method == "pdfplumber":
+                        print(f"  ⚠️ Modelo falhou com texto do pdfplumber, tentando com OCR/Tesseract...")
+                        use_tesseract = True
+                    else:
+                        # Use regras de fallback se OCR já foi tentado
+                        print(f"  ➤ Usando regras heurísticas para decisão...")
+                        is_new_doc = self._is_document_break(page_text)
+                        print(f"  ✅ Decisão heurística: {'NOVO documento' if is_new_doc else 'Continuação'}")
+            except Exception as e:
+                print(f"  ❌ Erro ao consultar IA: {e}")
+                
+                if extraction_method == "pdfplumber":
+                    print(f"  ⚠️ Modelo falhou com texto do pdfplumber, tentando com OCR/Tesseract...")
+                    use_tesseract = True
+                else:
+                    # Use regras de fallback para decidir
+                    print(f"  ➤ Usando regras heurísticas para decisão...")
+                    is_new_doc = self._is_document_break(page_text)
+                    print(f"  ✅ Decisão heurística: {'NOVO documento' if is_new_doc else 'Continuação'}")
 
-            # Se for novo documento e já temos páginas acumuladas, finalize o anterior
+            # Se precisar tentar com Tesseract mesmo após pdfplumber ter funcionado
+            if use_tesseract:
+                try:
+                    print(f"  ➤ Tentando extrair texto com OCR/Tesseract para melhorar a qualidade...")
+                    images = convert_from_path(
+                        self.pdf_path, 
+                        first_page=page_number,
+                        last_page=page_number
+                    )
+                    if images:
+                        ocr_text = pytesseract.image_to_string(images[0], lang='por')
+                        if ocr_text.strip():
+                            print(f"  ✅ Texto extraído com OCR ({len(ocr_text)} caracteres)")
+                            
+                            # Enviar texto OCR para o modelo
+                            print(f"  ➤ Enviando texto OCR para o modelo {self.llm.model}...")
+                            resposta_ocr = chain.invoke({"text": ocr_text})
+                            
+                            if resposta_ocr and resposta_ocr.strip().startswith("{"):
+                                print(f"  ✅ Resposta do OCR recebida em formato JSON")
+                                info_ocr = json.loads(resposta_ocr)
+                                is_new_doc = info_ocr.get("novo_documento", "").strip().upper().startswith("SIM")
+                                titulo = info_ocr.get("titulo", "") or titulo
+                                resumo = info_cr.get("resumo", "") or resumo
+                                data = info_ocr.get("data") or data
+                                valores = info_ocr.get("valores", []) or valores
+                                
+                                print(f"  📊 Resultado da nova análise (OCR):")
+                                print(f"     - É novo documento: {'SIM' if is_new_doc else 'NÃO'}")
+                                print(f"     - Título: {titulo[:50] + '...' if len(titulo) > 50 else titulo}")
+                            else:
+                                print(f"  ⚠️ Resposta OCR da IA não é JSON válido, mantendo resultados anteriores")
+                    else:
+                        print(f"  ⚠️ Não foi possível converter a página em imagem")
+                except Exception as e:
+                    print(f"  ❌ OCR fallback falhou: {e}")
+            
+            # ETAPA 3: ANÁLISE DE LIMITE DE DOCUMENTO
+            print(f"⚙️ ETAPA 3: Analisando limites de documento...")
+            
+            # Sempre considerar a primeira página como novo documento
+            if page_number == 1:
+                is_new_doc = True
+                print(f"  ✅ Primeira página: Definida como INÍCIO do primeiro documento")
+            
+            # 3.1. Processa o resultado e organiza os documentos
             if is_new_doc and current_doc_pages:
-                doc_end = i
+                # Finaliza o documento atual
+                doc_end = page_number - 1
+                print(f"  ✅ DOCUMENTO FINALIZADO: páginas {current_doc_start+1}-{doc_end}")
+                
                 documents.append({
                     "start_page": current_doc_start + 1,
                     "end_page": doc_end,
                     "pages_content": current_doc_pages,
+                    "titles": current_doc_titles,
                     "resumos": current_doc_resumos,
                     "datas": current_doc_datas,
                     "valores": current_doc_valores
                 })
-                print(f"  ✅ Documento finalizado: páginas {current_doc_start+1}-{doc_end}")
+                
                 # Inicia novo documento
-                current_doc_pages = [page_content]
-                current_doc_start = i
+                print(f"  ✅ NOVO DOCUMENTO INICIADO na página {page_number}")
+                current_doc_pages = [page_text]
+                current_doc_start = page_number - 1
+                current_doc_titles = [titulo]
                 current_doc_resumos = [resumo]
                 current_doc_datas = [data]
                 current_doc_valores = [valores]
             else:
-                current_doc_pages.append(page_content)
+                if is_new_doc:
+                    print(f"  ✅ NOVO DOCUMENTO INICIADO na página {page_number} (primeiro documento)")
+                else:
+                    print(f"  ✅ Página {page_number} adicionada ao documento atual")
+                    
+                current_doc_pages.append(page_text)
+                current_doc_titles.append(titulo)
                 current_doc_resumos.append(resumo)
                 current_doc_datas.append(data)
                 current_doc_valores.append(valores)
 
+            print("-" * 80)
+            print(f"📄 PÁGINA {page_number}/{total_pages} - PROCESSAMENTO CONCLUÍDO")
+
+        # ETAPA 4: FINALIZAÇÃO E ADIÇÃO DO ÚLTIMO DOCUMENTO
+        print("\n⚙️ ETAPA 4: Finalizando processamento...")
+        
         # Adiciona o último documento
         if current_doc_pages:
+            print(f"  ✅ DOCUMENTO FINAL FINALIZADO: páginas {current_doc_start+1}-{total_pages}")
+            
             documents.append({
                 "start_page": current_doc_start + 1,
-                "end_page": len(pages_content),
+                "end_page": total_pages,
                 "pages_content": current_doc_pages,
+                "titles": current_doc_titles,
                 "resumos": current_doc_resumos,
                 "datas": current_doc_datas,
                 "valores": current_doc_valores
             })
-            print(f"  ✅ Documento final: páginas {current_doc_start+1}-{len(pages_content)}")
-
+        
         print(f"📑 Identificados {len(documents)} documentos no PDF")
         return documents
 
