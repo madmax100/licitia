@@ -9,11 +9,16 @@ import subprocess
 import sys
 import json
 import shutil
-from typing import List, Dict, Tuple
-from pdf2image import convert_from_path
+from typing import List, Dict, Tuple, Optional
+from pdf2image import convert_from_path, pdfinfo_from_path
+from pdf2image.exceptions import PDFInfoNotInstalledError, PDFPageCountError # Import specific exceptions
 from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
 from langchain_ollama import OllamaLLM
+import logging # Added for better logging
+
+# Setup basic logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 try:
     import pdfplumber
@@ -23,392 +28,381 @@ except ImportError:
 
 def check_poppler_installation():
     """Verifica se o Poppler está instalado e no PATH."""
+    # 1. Try running pdfinfo directly using pdf2image's expected mechanism first
     try:
-        # Tenta executar o comando pdfinfo
-        result = subprocess.run(['pdfinfo'], 
-                              stdout=subprocess.PIPE, 
-                              stderr=subprocess.PIPE,
-                              text=True,
-                              timeout=2)
-        
-        # Se o comando retornar algo (mesmo que seja erro), significa que o pdfinfo existe
+        # Create a dummy empty PDF in memory to test pdfinfo_from_path
+        # This avoids the NoneType error and properly tests pdf2image's ability to call pdfinfo
+        dummy_pdf_path = os.path.join(tempfile.gettempdir(), "dummy_test.pdf")
+        with open(dummy_pdf_path, "w") as f:
+             f.write("%PDF-1.0\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj 2 0 obj<</Type/Pages/Count 0>>endobj\nxref\n0 3\n0000000000 65535 f\n0000000010 00000 n\n0000000058 00000 n\ntrailer<</Size 3/Root 1 0 R>>startxref\n108\n%%EOF")
+
+        pdfinfo_from_path(dummy_pdf_path, timeout=5)
+        os.remove(dummy_pdf_path) # Clean up dummy file
+        logging.info("Poppler check successful using pdfinfo_from_path with dummy PDF.")
         return True
-    except (subprocess.SubprocessError, FileNotFoundError, subprocess.TimeoutExpired):
-        # Verifica se o Poppler está em locais comuns no Windows
-        common_paths = [
-            # Adicione o caminho personalizado como primeira opção
-            r"C:\Users\Cirilo\Downloads\Release-24.08.0-0\poppler-24.08.0\Library\bin",
-            r"C:\Program Files\poppler\bin",
-            r"C:\Program Files (x86)\poppler\bin",
-            r"C:\poppler\bin",
-            os.path.join(os.environ.get('LOCALAPPDATA', ''), 'poppler', 'bin')
-        ]
-        
-        for path in common_paths:
-            if os.path.exists(path) and os.path.exists(os.path.join(path, 'pdfinfo.exe')):
-                # Adiciona o caminho ao PATH do processo atual
-                print(f"🔍 Poppler encontrado em: {path}")
-                os.environ['PATH'] = path + os.pathsep + os.environ['PATH']
+    except PDFInfoNotInstalledError:
+         logging.warning("Poppler check using pdfinfo_from_path failed: PDFInfoNotInstalledError. Trying common paths...")
+         if 'dummy_pdf_path' in locals() and os.path.exists(dummy_pdf_path):
+             os.remove(dummy_pdf_path)
+    except Exception as e_pdfinfo: # Catch other potential errors
+        logging.warning(f"Poppler check using pdfinfo_from_path failed: {type(e_pdfinfo).__name__}: {e_pdfinfo}. Trying common paths...")
+        if 'dummy_pdf_path' in locals() and os.path.exists(dummy_pdf_path):
+             os.remove(dummy_pdf_path)
+
+    # 2. If direct check fails, search common paths and test 'pdfinfo -v'
+    common_paths = [
+        r"C:\Users\Cirilo\Downloads\Release-24.08.0-0\poppler-24.08.0\Library\bin", # Custom path first
+        r"C:\Program Files\poppler\bin",
+        r"C:\Program Files (x86)\poppler\bin",
+        r"C:\poppler\bin",
+        os.path.join(os.environ.get('LOCALAPPDATA', ''), 'poppler', 'bin')
+    ]
+    original_path = os.environ['PATH']
+
+    for path in common_paths:
+        pdfinfo_exe = os.path.join(path, 'pdfinfo.exe')
+        if os.path.exists(path) and os.path.exists(pdfinfo_exe):
+            logging.info(f"Found potential Poppler pdfinfo.exe in: {path}. Verifying execution...")
+            try:
+                # Temporarily add to PATH for subprocess check
+                os.environ['PATH'] = path + os.pathsep + original_path
+                # Use subprocess to run 'pdfinfo -v' which should succeed if poppler is working
+                result = subprocess.run(['pdfinfo', '-v'], capture_output=True, text=True, check=True, timeout=5)
+                logging.info(f"Poppler check successful after adding path {path}. Output: {result.stderr.strip()}")
+                # Keep the modified PATH for the rest of the script execution
                 return True
-        
-        return False
+            except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e_verify:
+                 logging.warning(f"Poppler check failed for path {path}: {e_verify}")
+                 os.environ['PATH'] = original_path # Restore original PATH if this attempt failed
+                 continue # Try next path
+            except Exception as e_general: # Catch any other unexpected error
+                 logging.error(f"Unexpected error during Poppler verification for path {path}: {e_general}")
+                 os.environ['PATH'] = original_path # Restore original PATH
+                 continue
+
+    # Restore original PATH if no path worked
+    os.environ['PATH'] = original_path
+    logging.error("Poppler not found or pdfinfo command failed in common paths and PATH.")
+    return False
 
 class PDFReader:
-    def __init__(self, pdf_path, tesseract_path=None, use_ocr=True, max_pages_per_doc=20, model_name="phi4"):
+    # Change the default model name here
+    def __init__(self, pdf_path, tesseract_path=None, model_name="phi4", ollama_base_url="http://localhost:11434"):
         """
         Initialize the PDF reader.
-        
+
         Args:
-            pdf_path (str): Path to the PDF file
-            tesseract_path (str, optional): Path to Tesseract executable
+            pdf_path (str): Path to the PDF file.
+            tesseract_path (str, optional): Path to Tesseract executable.
+            model_name (str): Name of the Ollama model to use (default changed to phi4).
+            ollama_base_url (str): Base URL for the Ollama server.
         """
         self.pdf_path = pdf_path
         if tesseract_path:
             pytesseract.pytesseract.tesseract_cmd = tesseract_path
-        
-        # Verifica se o Poppler está instalado
-        if use_ocr:
-            if not check_poppler_installation():
-                print("\nAVISO: Poppler não encontrado. O OCR será desativado.")
-                print("Para instalar o Poppler no Windows:")
-                print("1. Baixe o Poppler do site: https://github.com/oschwartz10612/poppler-windows/releases/")
-                print("2. Extraia o arquivo ZIP")
-                print("3. Copie a pasta 'bin' para C:\\Program Files\\poppler\\bin")
-                print("4. Adicione C:\\Program Files\\poppler\\bin ao PATH do sistema")
-                print("5. Reinicie o computador")
-                self.use_ocr = False
-            else:
-                print("Poppler encontrado com sucesso! OCR ativado.")
-        
-        # Template para extrair informações do documento
-        self.prompt_template = PromptTemplate(
+
+        # Check Poppler installation (required for pdf2image)
+        if not check_poppler_installation():
+            logging.error("Poppler is not installed or not found/working in PATH. OCR functionality depends on Poppler.")
+            print("\nCRITICAL ERROR: Poppler not found or not working. pdf2image cannot function.")
+            print("Please install Poppler and ensure its 'bin' directory is in your system's PATH and the executables run correctly.")
+            print("Download from: https://github.com/oschwartz10612/poppler-windows/releases/")
+            # Consider raising an exception or exiting if Poppler is essential
+            raise RuntimeError("Poppler installation not found or not functional. Cannot proceed with OCR.")
+        else:
+            logging.info("Poppler found and verified. OCR enabled.")
+
+        # Updated prompt for page analysis and data extraction
+        self.page_analysis_prompt = PromptTemplate(
             input_variables=["text"],
             template="""
-            Analise o seguinte texto e extraia as seguintes informações:
-            1. Título do documento
-            2. Data de assinatura (se houver)
-            
-            Texto: {text}
-            
-            Responda no formato JSON:
+            Analise o seguinte texto extraído de UMA PÁGINA de um documento PDF:
+
+            Texto da Página:
+            {text}
+
+            Tarefas:
+            1. Determine se esta página representa o INÍCIO de um NOVO documento lógico (ex: um novo ofício, um novo contrato, uma nova nota fiscal começando nesta página) ou se é uma CONTINUAÇÃO do documento da página anterior.
+            2. Extraia as seguintes informações DESTA PÁGINA, se presentes:
+                - Título conciso que descreva o conteúdo principal da página.
+                - Descrição breve (1-2 frases) do assunto principal da página.
+                - Data principal mencionada na página (formato DD/MM/AAAA, se possível).
+                - Tipo de documento aparente nesta página (ex: Ofício, Contrato, Nota Fiscal, Relatório, Anexo, Despacho, Indefinido).
+                - Número principal do documento/processo mencionado na página.
+                - Valor monetário principal (R$) mencionado na página.
+                - Objeto ou assunto principal do documento descrito na página.
+
+            Responda OBRIGATORIAMENTE no seguinte formato JSON. Se uma informação não for encontrada, use "Não encontrado" ou null.
+
             {{
-                "titulo": "título do documento",
-                "data_assinatura": "data de assinatura (se encontrada)"
+              "novo_documento": true ou false,
+              "titulo": "...",
+              "descricao": "...",
+              "data": "DD/MM/AAAA ou Não encontrado",
+              "tipo": "...",
+              "numero": "...",
+              "valor": "R$ X.XXX,XX ou Não encontrado",
+              "objeto": "..."
             }}
+
+            Resposta JSON:
             """
         )
-        
-        self.llm = OllamaLLM(model=model_name)
-        self.use_ocr = use_ocr
-        self.max_pages_per_doc = max_pages_per_doc
 
-    def _get_total_pages(self, pdf_path: str) -> int:
-        """Retorna o número total de páginas do PDF."""
-        with pdfplumber.open(pdf_path) as pdf:
-            return len(pdf.pages)
-
-    def _split_pdf(self, pdf_path: str) -> List[str]:
-        """Divide o PDF em arquivos menores se necessário."""
-        total_pages = self._get_total_pages(pdf_path)
-        if total_pages <= self.max_pages_per_doc:
-            return [pdf_path]
-        
-        # Cria diretório temporário para os PDFs divididos
-        temp_dir = tempfile.mkdtemp()
-        pdf_files = []
-        
-        with pdfplumber.open(pdf_path) as pdf:
-            for i in range(0, total_pages, self.max_pages_per_doc):
-                end_page = min(i + self.max_pages_per_doc, total_pages)
-                output_path = os.path.join(temp_dir, f'parte_{i//self.max_pages_per_doc + 1}.pdf')
-                
-                # Cria um novo PDF com as páginas do intervalo
-                with pdfplumber.open(pdf_path) as source:
-                    pages = source.pages[i:end_page]
-                    with pdfplumber.open(output_path, 'wb') as dest:
-                        for page in pages:
-                            dest.add_page(page)
-                
-                pdf_files.append(output_path)
-        
-        return pdf_files
-
-    def _extract_text_with_ocr(self, pdf_path: str) -> List[str]:
-        """Extrai texto de cada página do PDF usando OCR."""
-        if not check_poppler_installation():
-            raise RuntimeError("Poppler não está instalado. Por favor, instale o Poppler para usar OCR.")
-            
-        textos = []
-        with tempfile.TemporaryDirectory() as temp_dir:
-            try:
-                # Converte PDF para imagens
-                images = convert_from_path(pdf_path)
-                
-                for i, image in enumerate(images):
-                    # Salva a imagem temporariamente
-                    temp_image_path = os.path.join(temp_dir, f'page_{i}.png')
-                    image.save(temp_image_path, 'PNG')
-                    
-                    # Aplica OCR na imagem
-                    texto = pytesseract.image_to_string(Image.open(temp_image_path), lang='por')
-                    textos.append(texto)
-            except Exception as e:
-                print(f"Erro durante a conversão do PDF: {e}")
-                raise RuntimeError("Erro ao converter PDF para imagens. Verifique se o Poppler está instalado corretamente.")
-        
-        return textos
-
-    def _show_cursor_variables(self, current_doc: Dict, i: int, total_pages: int):
-        """Mostra as variáveis armazenadas no cursor."""
-        print("\nVariáveis do cursor:")
-        print(f"Página atual: {i}/{total_pages}")
-        print(f"Página de início do documento atual: {current_doc.get('pagina_inicio', 'N/A')}")
-        print(f"Página de fim do documento atual: {current_doc.get('pagina_fim', 'N/A')}")
-        print(f"Tamanho do texto atual: {len(current_doc.get('texto', ''))} caracteres")
-        print(f"Primeiros 100 caracteres do texto: {current_doc.get('texto', '')[:100]}...")
-        print("-" * 50)
-
-   
-        """Salva as variáveis do cursor em um arquivo JSON."""
-        log_file = "cursor_variables.json"
-        
-        # Cria o dicionário com as variáveis
-        cursor_data = {
-            "pagina_atual": i,
-            "total_paginas": total_pages,
-            "documento_atual": {
-                "pagina_inicio": current_doc.get('pagina_inicio', 'N/A'),
-                "pagina_fim": current_doc.get('pagina_fim', 'N/A'),
-                "tamanho_texto": len(current_doc.get('texto', '')),
-                "primeiros_100_caracteres": current_doc.get('texto', '')[:100]
-            }
-        }
-        
-        # Se o arquivo já existe, carrega os dados existentes
-        if os.path.exists(log_file):
-            with open(log_file, 'r', encoding='utf-8') as f:
-                try:
-                    existing_data = json.load(f)
-                except json.JSONDecodeError:
-                    existing_data = {"registros": []}
-        else:
-            existing_data = {"registros": []}
-        
-        # Adiciona o novo registro
-        existing_data["registros"].append(cursor_data)
-        
-        # Salva os dados atualizados
-        with open(log_file, 'w', encoding='utf-8') as f:
-            json.dump(existing_data, f, ensure_ascii=False, indent=4)
-
-    def process_pdf(self, pdf_path: str) -> Tuple[List[Dict], int]:
-        """Processa o PDF e retorna informações sobre cada documento e o total de páginas."""
-        total_pages = self._get_total_pages(pdf_path)
-        pdf_files = self._split_pdf(pdf_path)
-        all_documentos = []
-        
-        # Limpa o arquivo de log se ele existir
-        if os.path.exists("cursor_variables.json"):
-            os.remove("cursor_variables.json")
-        
-        for pdf_file in pdf_files:
-            documentos = []
-            
-            if self.use_ocr:
-                try:
-                    # Extrai texto usando OCR
-                    textos = self._extract_text_with_ocr(pdf_file)
-                except RuntimeError as e:
-                    print(f"Erro ao usar OCR: {e}")
-                    print("Continuando com extração de texto normal...")
-                    self.use_ocr = False
-                    textos = []
-                    with pdfplumber.open(pdf_file) as pdf:
-                        for page in pdf.pages:
-                            texto = page.extract_text()
-                            textos.append(texto if texto else "")
-            else:
-                # Extrai texto diretamente do PDF
-                textos = []
-                with pdfplumber.open(pdf_file) as pdf:
-                    for page in pdf.pages:
-                        texto = page.extract_text()
-                        textos.append(texto if texto else "")
-            
-            current_doc = {
-                "pagina_inicio": 1,
-                "texto": ""
-            }
-            
-            for i, texto in enumerate(textos, 1):
-                print(f"\rAnalisando página {i} de {total_pages}...", end="")
-                if not texto.strip():
-                    continue
-                
-                # Salva as variáveis do cursor a cada 10 páginas
-                if i % 10 == 0:
-                    self._save_cursor_variables(current_doc, i, total_pages)
-                
-                # Verifica se há uma quebra clara de documento
-                if self._is_document_break(texto):
-                    if current_doc["texto"]:
-                        # Processa o documento atual
-                        print(f"\nIdentificado novo documento na página {i}")
-                        info = self._process_document(current_doc)
-                        documentos.append(info)
-                    
-                    # Inicia novo documento
-                    current_doc = {
-                        "pagina_inicio": i,
-                        "texto": texto
-                    }
-                else:
-                    current_doc["texto"] += "\n" + texto
-                    current_doc["pagina_fim"] = i
-            
-            # Processa o último documento
-            if current_doc["texto"]:
-                info = self._process_document(current_doc)
-                documentos.append(info)
-            
-            all_documentos.extend(documentos)
-        
-        print("\nAnálise concluída!")
-        print(f"Variáveis do cursor salvas em cursor_variables.json")
-        return all_documentos, total_pages
-
-    def _is_document_break(self, texto: str) -> bool:
-        """Verifica se há uma quebra clara de documento."""
-        # Texto muito curto geralmente indica uma quebra (página de separação ou início de documento)
-        if len(texto.strip()) < 150 and len(texto.strip()) > 10:
-            # Pequenos textos isolados frequentemente são separadores ou páginas de título
-            return True
-            
-        # Verifica se o texto começa com numeração (comum em novos documentos)
-        if re.match(r'^\s*\d+[\.-]\s+', texto[:50]):
-            return True
-            
-        # Verifica se há cabeçalhos comuns que indicam novos documentos
-        cabecalhos = ['ofício', 'memorando', 'relatório', 'carta', 'despacho', 'certidão', 
-                      'parecer', 'anexo', 'termo', 'formulário', 'requerimento', 'documento',
-                      'comprovante', 'declaração', 'notificação', 'intimação', 'informação',
-                      'pedido', 'solicitação', 'prestação', 'aviso', 'comunicado']
-                      
-        for cabecalho in cabecalhos:
-            if re.search(fr'^\s*{cabecalho}\b', texto[:100], re.IGNORECASE):
-                return True
-        
-        # Verifica se começa com data (comum em novos documentos)
-        if re.search(r'^\s*\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}', texto[:50]):
-            return True
-            
-        # Verifica por números de processo, protocolos, etc.
-        if re.search(r'\b(processo|sei|protocolo|registro)[\s\.:].*?\d+', texto[:200], re.IGNORECASE):
-            return True
-            
-        # Verifica números de documentos
-        if re.search(r'\b(n[º°\.]*|número)[\s:]*\d+[/.-]?\d*', texto[:200], re.IGNORECASE):
-            return True
-            
-        # Verifica por assinaturas no final da página anterior
-        if re.search(r'(atenciosamente|respeitosamente|cordialmente)\s*[,\.]\s*$', texto, re.IGNORECASE):
-            return True
-            
-        # Padrões que podem indicar início de novo documento
-        padroes = [
-            r"^\s*DOCUMENTO\s*",
-            r"^\s*CONTRATO\s*",
-            r"^\s*TERMO\s*DE\s*",
-            r"^\s*ATA\s*DE\s*",
-            r"^\s*PROCESSO\s*",
-            r"^\s*PETIÇÃO\s*",
-            r"^\s*SENTENÇA",
-            r"^\s*DECISÃO",
-            r"^\s*DESPACHO",
-            r"^\s*CERTIDÃO",
-            r"^\s*REQUERIMENTO",
-            r"^\s*OFÍCIO",
-            r"^\s*NOTIFICAÇÃO",
-            r"^\s*INTIMAÇÃO",
-            r"^\s*CITAÇÃO",
-            r"^\s*MANDADO",
-            r"^\s*EDITAL",
-            r"^\s*LAUDO",
-            r"^\s*PERÍCIA",
-            r"^\s*INQUÉRITO",
-            r"^\s*MINISTÉRIO\s*",
-            r"^\s*DEPARTAMENTO\s*",
-            r"^\s*SECRETARIA\s*",
-            r"^\s*DELEGACIA\s*",
-            r"^\s*PLANILHA\s*"
-        ]
-        
-        # Verifica se o texto começa com algum dos padrões
-        for padrao in padroes:
-            if re.search(padrao, texto[:200], re.IGNORECASE):
-                return True
-                
-        # Verifica por cabeçalhos/logos no topo da página
-        if re.search(r'^[\s\*=-]{0,10}[A-ZÇÁÉÍÓÚÂÊÎÔÛÃÕ\s]{10,}[\s\*=-]{0,10}$', texto[:200], re.MULTILINE):
-            return True
-        
-        # Verifica por uma mudança significativa no conteúdo
-        palavras_chave = ["processo", "petição", "sentença", "decisão", "despacho",
-                          "certidão", "requerimento", "ofício", "notificação", "intimação",
-                          "citação", "mandado", "edital", "laudo", "perícia", "inquérito",
-                          "planilha", "orçamentária", "projeto", "básico", "licitação",
-                          "proposta", "contrato", "parecer", "ata", "memorial", "cronograma",
-                          "termo", "relatório", "requisição", "empenho", "comprovante"]
-        
-        # Conta a ocorrência de palavras-chave no texto - precisa de pelo menos 2
-        contagem = sum(1 for palavra in palavras_chave if palavra.lower() in texto.lower())
-        return contagem >= 2
-
-    def _process_document(self, doc: Dict) -> Dict:
-        """Processa um documento individual usando o modelo de IA."""
         try:
-            # Template mais detalhado para extrair informações
-            prompt_template = PromptTemplate(
-                input_variables=["text"],
-                template="""
-                Analise o seguinte texto e extraia as seguintes informações:
-                1. Título do documento (se houver)
-                2. Descrição do documento (resumo do conteúdo)
-                3. Data do documento (se houver)
-                4. Tipo de documento (contrato, edital, parecer, etc)
-                5. Número do documento (se houver)
-                6. Valor (se mencionado)
-                7. Objeto (se mencionado)
-                
-                Texto: {text}
-                
-                Responda no formato JSON:
-                {{
-                    "titulo": "título do documento",
-                    "descricao": "descrição do documento",
-                    "data": "data do documento",
-                    "tipo": "tipo do documento",
-                    "numero": "número do documento",
-                    "valor": "valor mencionado",
-                    "objeto": "objeto do documento"
-                }}
-                """
-            )
-            
-            chain = LLMChain(llm=self.llm, prompt=prompt_template)
-            resultado = chain.invoke({"text": doc["texto"]})
-            info = json.loads(resultado["text"])
-            
-            # Adiciona informações de paginação
-            info.update({
-                "pagina_inicio": doc["pagina_inicio"],
-                "pagina_fim": doc.get("pagina_fim", doc["pagina_inicio"])
-            })
-            
-            return info
+            self.llm = OllamaLLM(model=model_name, base_url=ollama_base_url)
+            # Test connection
+            self.llm.invoke("Test prompt")
+            logging.info(f"Successfully connected to Ollama model '{model_name}' at {ollama_base_url}")
         except Exception as e:
-            print(f"Erro ao processar documento: {e}")
-            return {
+            logging.error(f"Failed to initialize or connect to Ollama model '{model_name}' at {ollama_base_url}: {e}")
+            # Depending on requirements, you might want to raise an error or fallback
+            raise RuntimeError(f"Could not connect to Ollama: {e}")
+
+        self.page_analysis_chain = LLMChain(llm=self.llm, prompt=self.page_analysis_prompt)
+
+    def _get_total_pages(self) -> int:
+        """Retorna o número total de páginas do PDF usando pdfinfo."""
+        try:
+            pdf_info = pdfinfo_from_path(self.pdf_path, timeout=30) # Increased timeout
+            pages = pdf_info.get('Pages')
+            if pages is None:
+                 raise ValueError("Could not extract 'Pages' from pdfinfo output.")
+            return int(pages) # Ensure it's an integer
+        except (PDFInfoNotInstalledError, PDFPageCountError, ValueError, Exception) as e: # Catch more specific errors
+            logging.error(f"Could not get page count using pdfinfo: {type(e).__name__}: {e}. Trying pdfplumber.")
+            if PDFPLUMBER_AVAILABLE:
+                try:
+                    with pdfplumber.open(self.pdf_path) as pdf:
+                        return len(pdf.pages)
+                except Exception as e_plumber:
+                    logging.error(f"Could not get page count using pdfplumber: {e_plumber}")
+                    raise RuntimeError(f"Failed to determine page count for {self.pdf_path}") from e
+            else:
+                 raise RuntimeError(f"pdfinfo failed and pdfplumber is not available. Cannot determine page count for {self.pdf_path}") from e
+
+    def _extract_text_from_page_ocr(self, page_number: int, temp_dir: str) -> Optional[str]:
+        """Extrai texto de uma única página do PDF usando OCR."""
+        image_path = None # Initialize image_path
+        try:
+            # Convert only the specific page to an image
+            images = convert_from_path(
+                self.pdf_path,
+                dpi=300, # Higher DPI can improve OCR accuracy
+                first_page=page_number,
+                last_page=page_number,
+                fmt='png', # Specify format
+                thread_count=1, # Process one page at a time
+                output_folder=temp_dir,
+                timeout=60 # Timeout for conversion
+            )
+
+            if images:
+                # pdf2image >= 1.17.0 returns PIL Image objects directly
+                # We need to save the image temporarily to pass its path to Tesseract
+                # Use a more specific temporary filename
+                temp_image_filename = os.path.join(temp_dir, f"page_{page_number}.png")
+                images[0].save(temp_image_filename, "PNG")
+                image_path = temp_image_filename # Store path for cleanup
+
+                # Apply OCR
+                texto = pytesseract.image_to_string(Image.open(image_path), lang='por', config='--psm 3') # PSM 3: Auto page segmentation
+                return texto
+            else:
+                logging.warning(f"Could not convert page {page_number} to image.")
+                return None
+        except Exception as e:
+            logging.error(f"Error during OCR for page {page_number}: {e}")
+            return None # Return None on error
+        finally:
+             # Clean up the temporary image file if it was created
+            if image_path and os.path.exists(image_path):
+                try:
+                    os.remove(image_path)
+                except OSError as oe:
+                    logging.warning(f"Could not remove temporary image {image_path}: {oe}")
+
+
+    def _parse_llm_response(self, response_text: str, page_number: int) -> Dict:
+        """Tenta analisar a resposta JSON do LLM, com fallback."""
+        fallback_data = {
+            "novo_documento": False, # Default to continuation if unsure
+            "titulo": "Erro na Análise",
+            "descricao": "Não foi possível analisar a resposta da IA.",
+            "data": "Não encontrado",
+            "tipo": "Não identificado",
+            "numero": "Não encontrado",
+            "valor": "Não encontrado",
+            "objeto": "Não encontrado"
+        }
+        try:
+            # Clean potential markdown code fences
+            if response_text.strip().startswith("```json"):
+                response_text = response_text.strip()[7:]
+                if response_text.strip().endswith("```"):
+                    response_text = response_text.strip()[:-3]
+
+            # Find the JSON part more robustly
+            match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if match:
+                json_str = match.group(0)
+                data = json.loads(json_str)
+                # Validate required keys (optional but good practice)
+                if "novo_documento" not in data:
+                    logging.warning(f"LLM response for page {page_number} missing 'novo_documento'. Assuming False.")
+                    data["novo_documento"] = False # Assume continuation if missing
+                    # return fallback_data # Or assume False and continue processing other fields
+                # Ensure boolean conversion if necessary
+                if isinstance(data.get("novo_documento"), str):
+                    data["novo_documento"] = data["novo_documento"].strip().lower() == 'true'
+                elif not isinstance(data.get("novo_documento"), bool):
+                     logging.warning(f"LLM response for page {page_number} has non-boolean 'novo_documento': {data.get('novo_documento')}. Assuming False.")
+                     data["novo_documento"] = False
+
+
+                # Fill missing optional keys with default values
+                for key, default_value in fallback_data.items():
+                    # Don't overwrite novo_documento if it was successfully parsed/defaulted above
+                    if key == "novo_documento":
+                        continue
+                    if key not in data or data[key] is None or data[key] == "":
+                         data[key] = default_value
+
+                return data
+            else:
+                logging.warning(f"Could not find valid JSON in LLM response for page {page_number}. Response: {response_text[:100]}...")
+                return fallback_data
+        except json.JSONDecodeError as e:
+            logging.error(f"JSONDecodeError for page {page_number}: {e}. Response: {response_text[:100]}...")
+            return fallback_data
+        except Exception as e:
+            logging.error(f"Unexpected error parsing LLM response for page {page_number}: {e}")
+            return fallback_data
+
+    def identify_documents_page_by_page(self) -> List[Dict]:
+        """
+        Identifica documentos processando cada página com OCR e LLM.
+
+        Returns:
+            List[Dict]: Uma lista de dicionários, onde cada dicionário representa
+                       um documento identificado, contendo metadados consolidados
+                       e as páginas inicial/final.
+        """
+        logging.info(f"Starting page-by-page document identification for: {self.pdf_path}")
+        if not os.path.exists(self.pdf_path):
+            logging.error(f"PDF file not found: {self.pdf_path}")
+            raise FileNotFoundError(f"PDF file not found: {self.pdf_path}")
+
+        total_pages = self._get_total_pages()
+        if total_pages == 0:
+            logging.warning(f"PDF file seems empty or unreadable (0 pages): {self.pdf_path}")
+            return []
+
+        logging.info(f"Total pages detected: {total_pages}")
+
+        identified_documents = []
+        current_document_pages_data = []
+        current_doc_start_page = 1
+
+        # Use a temporary directory for images
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for page_num in range(1, total_pages + 1):
+                logging.info(f"Processing Page {page_num}/{total_pages}...")
+
+                # 1. Extract text using OCR
+                page_text = self._extract_text_from_page_ocr(page_num, temp_dir)
+
+                page_analysis_result = None
+                if page_text and page_text.strip():
+                    logging.info(f"  Page {page_num}: OCR successful ({len(page_text)} chars). Analyzing with LLM...")
+                    # 2. Analyze text with LLM
+                    try:
+                        llm_response = self.page_analysis_chain.invoke({"text": page_text})
+                        # Handle potential variations in Langchain output structure
+                        if isinstance(llm_response, dict) and "text" in llm_response:
+                            response_text = llm_response.get("text", "")
+                        elif isinstance(llm_response, str):
+                             response_text = llm_response
+                        else:
+                             response_text = str(llm_response) # Fallback
+
+                        logging.info(f"  Page {page_num}: LLM response received. Parsing...")
+                        page_analysis_result = self._parse_llm_response(response_text, page_num)
+                        logging.info(f"  Page {page_num}: Parsed analysis: novo_documento={page_analysis_result.get('novo_documento')}, tipo={page_analysis_result.get('tipo')}")
+                    except Exception as e:
+                        logging.error(f"  Page {page_num}: Error invoking LLM chain: {e}")
+                        page_analysis_result = self._parse_llm_response("", page_num) # Use fallback on error
+                else:
+                    logging.warning(f"  Page {page_num}: No text extracted via OCR or text is empty. Skipping LLM analysis.")
+                    # Create a minimal entry for empty/failed pages
+                    page_analysis_result = {
+                        "novo_documento": False, # Assume continuation for empty pages
+                        "titulo": "Página Vazia/Falha OCR",
+                        "descricao": "Não foi possível extrair texto.",
+                        "data": "Não encontrado", "tipo": "Não identificado", "numero": "Não encontrado",
+                        "valor": "Não encontrado", "objeto": "Não encontrado"
+                    }
+
+                # 3. Determine document boundaries
+                is_new_doc = page_analysis_result.get("novo_documento", False)
+
+                # Force first page to be a new document
+                if page_num == 1:
+                    is_new_doc = True
+                    logging.info(f"  Page {page_num}: Marked as start of the first document.")
+
+                if is_new_doc and current_document_pages_data:
+                    # Finalize the previous document
+                    end_page = page_num - 1
+                    logging.info(f"  Page {page_num}: New document detected. Finalizing previous document (Pages {current_doc_start_page}-{end_page}).")
+
+                    # Consolidate data (using first page's data for now)
+                    # --- Consolidation Strategy ---
+                    # Simple: Take data from the first page of the segment.
+                    # More complex strategies could involve merging data, prioritizing certain pages, etc.
+                    consolidated_data = current_document_pages_data[0].copy() # Take data from the first page
+                    consolidated_data["pagina_inicio"] = current_doc_start_page
+                    consolidated_data["pagina_fim"] = end_page
+                    # Remove the per-page flag after consolidation
+                    consolidated_data.pop("novo_documento", None)
+
+                    identified_documents.append(consolidated_data)
+
+                    # Start the new document
+                    current_doc_start_page = page_num
+                    current_document_pages_data = [page_analysis_result]
+                else:
+                    # Continue current document
+                    if is_new_doc and not current_document_pages_data:
+                         logging.info(f"  Page {page_num}: Starting the very first document.")
+                    elif not is_new_doc:
+                         logging.info(f"  Page {page_num}: Continuing current document.")
+                    current_document_pages_data.append(page_analysis_result)
+
+            # 4. Add the last document
+            if current_document_pages_data:
+                end_page = total_pages
+                logging.info(f"Processing finished. Finalizing last document (Pages {current_doc_start_page}-{end_page}).")
+                consolidated_data = current_document_pages_data[0].copy() # Take data from the first page
+                consolidated_data["pagina_inicio"] = current_doc_start_page
+                consolidated_data["pagina_fim"] = end_page
+                consolidated_data.pop("novo_documento", None)
+                identified_documents.append(consolidated_data)
+
+        logging.info(f"Document identification complete. Found {len(identified_documents)} documents.")
+        return identified_documents
+
+    # --- Methods below might be deprecated or need refactoring based on the new approach ---
+
+    # Consider removing or refactoring process_pdf, _is_document_break, _process_document,
+    # _extract_text_with_ocr (replaced by _extract_text_from_page_ocr),
+    # _split_pdf (not needed for page-by-page), extract_text, _show_cursor_variables, _save_cursor_variables
+    # if identify_documents_page_by_page becomes the primary method.
+
+    # Keep _process_document's fallback dictionary updated as a reference or for potential reuse.
+    def _get_fallback_document_info(self, start_page, end_page):
+         """Provides a default structure for error cases."""
+         return {
                 "titulo": "Documento não identificado",
                 "descricao": "Não foi possível extrair informações",
                 "data": "Não encontrada",
@@ -416,339 +410,61 @@ class PDFReader:
                 "numero": "Não encontrado",
                 "valor": "Não encontrado",
                 "objeto": "Não encontrado",
-                "pagina_inicio": doc["pagina_inicio"],
-                "pagina_fim": doc.get("pagina_fim", doc["pagina_inicio"])
+                "pagina_inicio": start_page,
+                "pagina_fim": end_page
             }
-    
-    def extract_text(self, use_ocr=False):
-        """
-        Extract text from a PDF file using PyMuPDF with fallback to pdfplumber.
-        
-        Args:
-            use_ocr (bool): Whether to use OCR for text extraction
-            
-        Returns:
-            list: List of strings containing text for each page
-        """
-        if not os.path.exists(self.pdf_path):
-            raise FileNotFoundError(f"PDF file not found: {self.pdf_path}")
-        
-        # Tenta primeiro com pdfplumber (que sabemos que está sendo importado)
+
+# Example Usage (optional, for testing)
+if __name__ == '__main__':
+    # Configure Tesseract path if needed
+    # tesseract_cmd_path = r'C:\Program Files\Tesseract-OCR\tesseract.exe' # Example path
+    tesseract_cmd_path = None # Set to None if Tesseract is in PATH
+
+    # Configure Ollama details
+    ollama_url = "http://localhost:11434" # Default Ollama URL
+    # Change the default model name here too
+    ollama_model = "phi4" # Or "llama3", "mistral", etc.
+
+    # --- !!! IMPORTANT: SET YOUR PDF FILE PATH HERE !!! ---
+    pdf_file_to_process = r"C:\Users\Cirilo\Documents\licitia\licitia\data\input\test.pdf" # <--- EXAMPLE PATH
+
+    if not pdf_file_to_process or not os.path.exists(pdf_file_to_process):
+        print(f"Error: PDF file not found at '{pdf_file_to_process}' or path is not set.")
+        print("Please set the 'pdf_file_to_process' variable in the script.")
+    else:
         try:
-            pages_content = []
-            with pdfplumber.open(self.pdf_path) as pdf:
-                for page in pdf.pages:
-                    text = page.extract_text(x_tolerance=3, y_tolerance=3)
-                    pages_content.append(text if text else "")
-                    
-            print(f"✅ Texto extraído com pdfplumber: {len(pages_content)} páginas")
-            return pages_content
-                    
-        except Exception as e:
-            print(f"⚠️ Error with pdfplumber: {e}. Tentando com OCR...")
-            
-            # Fallback para OCR se pdfplumber falhar
-            if use_ocr:
-                try:
-                    print("🔍 Iniciando extração com OCR...")
-                    images = convert_from_path(self.pdf_path)
-                    
-                    pages_content = []
-                    for i, image in enumerate(images):
-                        # Aplica OCR na imagem
-                        text = pytesseract.image_to_string(image, lang='por')
-                        pages_content.append(text)
-                        
-                    print(f"✅ Texto extraído com OCR: {len(pages_content)} páginas")
-                    return pages_content
-                    
-                except Exception as e2:
-                    raise Exception(f"Failed to extract text with both pdfplumber and OCR: {e}, {e2}")
-                
-            else:
-                raise Exception(f"pdfplumber failed and no valid text was extracted: {e}")
-
-    def identify_document_boundaries(self, pages_content=None, ai_processor=None):
-        """
-        Identifica os limites de cada documento no PDF processando cada página individualmente.
-        O fluxo tenta extrair texto e identificar documentos página por página.
-        """
-        print("\n🔍 INICIANDO PROCESSAMENTO PÁGINA A PÁGINA...")
-        print("=" * 80)
-
-        documents = []
-        current_doc_pages = []
-        current_doc_start = 0
-        current_doc_titles = []
-        current_doc_resumos = []
-        current_doc_datas = []
-        current_doc_valores = []
-        
-        # Prompt para o modelo principal
-        boundary_prompt = PromptTemplate(
-            input_variables=["text"],
-            template=(
-                "O texto a seguir foi extraído de uma página de um PDF.\n"
-                "1. Responda apenas com 'SIM' se esta página é o INÍCIO de um novo documento, ou 'NÃO' caso contrário.\n"
-                "2. Extraia um título e um resumo curto do conteúdo da página.\n"
-                "3. Se houver, extraia a data principal e valores monetários.\n"
-                "Responda no formato JSON:\n"
-                "{{\n"
-                "  \"novo_documento\": \"SIM\" ou \"NÃO\",\n"
-                "  \"titulo\": \"...\",\n"
-                "  \"resumo\": \"...\",\n"
-                "  \"data\": \"...\",\n"
-                "  \"valores\": [ ... ]\n"
-                "}}\n"
-                "Texto:\n{text}\n"
-                "Resposta:"
+            print(f"Initializing PDFReader for: {pdf_file_to_process}")
+            # The reader will now use 'phi4' by default if model_name isn't specified here
+            reader = PDFReader(
+                pdf_path=pdf_file_to_process,
+                tesseract_path=tesseract_cmd_path,
+                # model_name=ollama_model, # You can explicitly pass it too
+                ollama_base_url=ollama_url
             )
-        )
-        chain = boundary_prompt | self.llm
-        
-        # Determinar número total de páginas
-        with pdfplumber.open(self.pdf_path) as pdf:
-            total_pages = len(pdf.pages)
-        
-        print(f"📄 Total de páginas no PDF: {total_pages}")
-        print("=" * 80)
-        
-        # Processar cada página individualmente
-        for page_number in range(1, total_pages + 1):
-            print(f"\n📄 PÁGINA {page_number}/{total_pages} - INICIANDO PROCESSAMENTO")
-            print("-" * 80)
-            page_text = ""
-            extraction_method = "none"
-            
-            # ETAPA 1: EXTRAÇÃO DE TEXTO
-            print(f"⚙️ ETAPA 1: Tentando extrair texto da página {page_number}...")
-            
-            # 1.1. Tenta extrair com pdfplumber
-            try:
-                print(f"  ➤ Tentando extração com pdfplumber...")
-                with pdfplumber.open(self.pdf_path) as pdf:
-                    page = pdf.pages[page_number - 1]
-                    page_text = page.extract_text(x_tolerance=3, y_tolerance=3) or ""
-                    if page_text.strip():
-                        extraction_method = "pdfplumber"
-                        print(f"  ✅ Texto extraído com pdfplumber ({len(page_text)} caracteres)")
-                    else:
-                        print(f"  ⚠️ pdfplumber extraiu texto vazio ou apenas espaços")
-            except Exception as e:
-                print(f"  ❌ Erro ao extrair texto com pdfplumber: {e}")
-                page_text = ""
-            
-            # 1.2. Se pdfplumber falhou, tenta OCR com Tesseract
-            if not page_text.strip():
-                try:
-                    print(f"  ➤ Tentando extrair texto com OCR/Tesseract...")
-                    images = convert_from_path(
-                        self.pdf_path, 
-                        first_page=page_number,
-                        last_page=page_number
-                    )
-                    if images:
-                        page_text = pytesseract.image_to_string(images[0], lang='por')
-                        if page_text.strip():
-                            extraction_method = "ocr"
-                            print(f"  ✅ Texto extraído com OCR ({len(page_text)} caracteres)")
-                        else:
-                            print(f"  ⚠️ OCR extraiu texto vazio ou apenas espaços")
-                    else:
-                        print(f"  ⚠️ Não foi possível converter a página em imagem")
-                except Exception as e:
-                    print(f"  ❌ OCR falhou: {e}")
-                    page_text = ""
-            
-            # 1.3. Se não conseguiu extrair texto, continua para próxima página
-            if not page_text.strip():
-                print(f"  ⚠️ Não foi possível extrair texto da página {page_number} - pulando para próxima")
-                # Adiciona página vazia para manter a contagem correta
-                current_doc_pages.append("")
-                current_doc_titles.append("")
-                current_doc_resumos.append("")
-                current_doc_datas.append("")
-                current_doc_valores.append([])
-                continue
-            
-            # ETAPA 2: ENVIO DO TEXTO PARA O MODELO DE IA
-            print(f"⚙️ ETAPA 2: Enviando texto para o modelo de IA...")
-            is_new_doc = False
-            titulo = ""
-            resumo = ""
-            data = ""
-            valores = []
-            use_tesseract = False
 
-            try:
-                print(f"  ➤ Enviando texto para o modelo {self.llm.model}...")
-                resposta = chain.invoke({"text": page_text})
-                
-                # Verificar se a resposta tem formato JSON e informações válidas
-                if resposta and resposta.strip().startswith("{"):
-                    print(f"  ✅ Resposta recebida em formato JSON")
-                    print(f"  📝 Resposta: {resposta.strip()[:80]}...")
-                    
-                    info = json.loads(resposta)
-                    is_new_doc = info.get("novo_documento", "").strip().upper().startswith("SIM")
-                    titulo = info.get("titulo", "")
-                    resumo = info.get("resumo", "")
-                    data = info.get("data")
-                    valores = info.get("valores", [])
-                    
-                    # IMPORTANTE: Verificar se o texto foi suficiente para o modelo extrair informações úteis
-                    if (not titulo or titulo.lower() in ["", "documento sem título", "não especificado"]) and extraction_method == "pdfplumber":
-                        print(f"  ⚠️ Modelo não conseguiu extrair título com pdfplumber, tentando com OCR/Tesseract...")
-                        use_tesseract = True
-                else:
-                    print(f"  ⚠️ Resposta da IA não é JSON válido")
-                    print(f"  📝 Resposta bruta: {resposta[:50]}...")
-                    
-                    if extraction_method == "pdfplumber":
-                        print(f"  ⚠️ Modelo falhou com texto do pdfplumber, tentando com OCR/Tesseract...")
-                        use_tesseract = True
-                    else:
-                        # Use regras de fallback se OCR já foi tentado
-                        print(f"  ➤ Usando regras heurísticas para decisão...")
-                        is_new_doc = self._is_document_break(page_text)
-                        print(f"  ✅ Decisão heurística: {'NOVO documento' if is_new_doc else 'Continuação'}")
-            except Exception as e:
-                print(f"  ❌ Erro ao consultar IA: {e}")
-                
-                if extraction_method == "pdfplumber":
-                    print(f"  ⚠️ Modelo falhou com texto do pdfplumber, tentando com OCR/Tesseract...")
-                    use_tesseract = True
-                else:
-                    # Use regras de fallback para decidir
-                    print(f"  ➤ Usando regras heurísticas para decisão...")
-                    is_new_doc = self._is_document_break(page_text)
-                    print(f"  ✅ Decisão heurística: {'NOVO documento' if is_new_doc else 'Continuação'}")
+            print("\nStarting document identification...")
+            identified_docs = reader.identify_documents_page_by_page()
+            print("\n--- Document Identification Results ---")
 
-            # Se precisar tentar com Tesseract mesmo após pdfplumber ter funcionado
-            if use_tesseract:
-                try:
-                    print(f"  ➤ Tentando extrair texto com OCR/Tesseract para melhorar a qualidade...")
-                    images = convert_from_path(
-                        self.pdf_path, 
-                        first_page=page_number,
-                        last_page=page_number
-                    )
-                    if images:
-                        ocr_text = pytesseract.image_to_string(images[0], lang='por')
-                        if ocr_text.strip():
-                            print(f"  ✅ Texto extraído com OCR ({len(ocr_text)} caracteres)")
-                            
-                            # Enviar texto OCR para o modelo
-                            print(f"  ➤ Enviando texto OCR para o modelo {self.llm.model}...")
-                            resposta_ocr = chain.invoke({"text": ocr_text})
-                            
-                            if resposta_ocr and resposta_ocr.strip().startswith("{"):
-                                print(f"  ✅ Resposta do OCR recebida em formato JSON")
-                                info_ocr = json.loads(resposta_ocr)
-                                is_new_doc = info_ocr.get("novo_documento", "").strip().upper().startswith("SIM")
-                                titulo = info_ocr.get("titulo", "") or titulo
-                                resumo = info_cr.get("resumo", "") or resumo
-                                data = info_ocr.get("data") or data
-                                valores = info_ocr.get("valores", []) or valores
-                                
-                                print(f"  📊 Resultado da nova análise (OCR):")
-                                print(f"     - É novo documento: {'SIM' if is_new_doc else 'NÃO'}")
-                                print(f"     - Título: {titulo[:50] + '...' if len(titulo) > 50 else titulo}")
-                            else:
-                                print(f"  ⚠️ Resposta OCR da IA não é JSON válido, mantendo resultados anteriores")
-                    else:
-                        print(f"  ⚠️ Não foi possível converter a página em imagem")
-                except Exception as e:
-                    print(f"  ❌ OCR fallback falhou: {e}")
-            
-            # ETAPA 3: ANÁLISE DE LIMITE DE DOCUMENTO
-            print(f"⚙️ ETAPA 3: Analisando limites de documento...")
-            
-            # Sempre considerar a primeira página como novo documento
-            if page_number == 1:
-                is_new_doc = True
-                print(f"  ✅ Primeira página: Definida como INÍCIO do primeiro documento")
-            
-            # 3.1. Processa o resultado e organiza os documentos
-            if is_new_doc and current_doc_pages:
-                # Finaliza o documento atual
-                doc_end = page_number - 1
-                print(f"  ✅ DOCUMENTO FINALIZADO: páginas {current_doc_start+1}-{doc_end}")
-                
-                documents.append({
-                    "start_page": current_doc_start + 1,
-                    "end_page": doc_end,
-                    "pages_content": current_doc_pages,
-                    "titles": current_doc_titles,
-                    "resumos": current_doc_resumos,
-                    "datas": current_doc_datas,
-                    "valores": current_doc_valores
-                })
-                
-                # Inicia novo documento
-                print(f"  ✅ NOVO DOCUMENTO INICIADO na página {page_number}")
-                current_doc_pages = [page_text]
-                current_doc_start = page_number - 1
-                current_doc_titles = [titulo]
-                current_doc_resumos = [resumo]
-                current_doc_datas = [data]
-                current_doc_valores = [valores]
+            if identified_docs:
+                for i, doc in enumerate(identified_docs):
+                    print(f"\nDocument {i+1}:")
+                    print(f"  Páginas: {doc.get('pagina_inicio')} - {doc.get('pagina_fim')}")
+                    print(f"  Título: {doc.get('titulo')}")
+                    print(f"  Tipo: {doc.get('tipo')}")
+                    print(f"  Data: {doc.get('data')}")
+                    print(f"  Número: {doc.get('numero')}")
+                    print(f"  Valor: {doc.get('valor')}")
+                    print(f"  Objeto: {doc.get('objeto')}")
+                    print(f"  Descrição: {doc.get('descricao')}")
             else:
-                if is_new_doc:
-                    print(f"  ✅ NOVO DOCUMENTO INICIADO na página {page_number} (primeiro documento)")
-                else:
-                    print(f"  ✅ Página {page_number} adicionada ao documento atual")
-                    
-                current_doc_pages.append(page_text)
-                current_doc_titles.append(titulo)
-                current_doc_resumos.append(resumo)
-                current_doc_datas.append(data)
-                current_doc_valores.append(valores)
+                print("No documents were identified.")
 
-            print("-" * 80)
-            print(f"📄 PÁGINA {page_number}/{total_pages} - PROCESSAMENTO CONCLUÍDO")
-
-        # ETAPA 4: FINALIZAÇÃO E ADIÇÃO DO ÚLTIMO DOCUMENTO
-        print("\n⚙️ ETAPA 4: Finalizando processamento...")
-        
-        # Adiciona o último documento
-        if current_doc_pages:
-            print(f"  ✅ DOCUMENTO FINAL FINALIZADO: páginas {current_doc_start+1}-{total_pages}")
-            
-            documents.append({
-                "start_page": current_doc_start + 1,
-                "end_page": total_pages,
-                "pages_content": current_doc_pages,
-                "titles": current_doc_titles,
-                "resumos": current_doc_resumos,
-                "datas": current_doc_datas,
-                "valores": current_doc_valores
-            })
-        
-        print(f"📑 Identificados {len(documents)} documentos no PDF")
-        return documents
-
-    # Adicione esta função auxiliar para calcular similaridade de texto
-    def _text_similarity(self, text1, text2):
-        """Calcula a similaridade entre dois textos (medida simples)"""
-        if not text1 or not text2:
-            return 0
-            
-        # Remove espaços e pontuação para comparação
-        t1 = re.sub(r'[^\w\s]', '', text1.lower())
-        t2 = re.sub(r'[^\w\s]', '', text2.lower())
-        
-        # Divide em palavras
-        words1 = set(t1.split())
-        words2 = set(t2.split())
-        
-        # Calcula interseção
-        common = words1.intersection(words2)
-        
-        # Calcula coeficiente de Jaccard
-        if len(words1) == 0 and len(words2) == 0:
-            return 1.0
-        elif len(words1) == 0 or len(words2) == 0:
-            return 0.0
-        else:
-            return len(common) / (len(words1) + len(words2) - len(common))
+        except FileNotFoundError as e:
+            print(f"Error: {e}")
+        except RuntimeError as e:
+            # Catch the specific Poppler error from __init__
+            print(f"Initialization Error: {e}")
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+            logging.exception("Unexpected error during main execution.") # Log traceback
