@@ -20,6 +20,17 @@ import logging # Added for better logging
 # Setup basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# filepath: c:\Users\Cirilo\Documents\licitia\pdf-document-analyzer\src\main.py
+import os
+import shutil
+print("--- System PATH ---")
+print(os.environ.get('PATH'))
+print("--- Checking pdftoppm ---")
+print(shutil.which("pdftoppm"))
+print("--- Checking pdfinfo ---")
+print(shutil.which("pdfinfo"))
+print("---------------------")
+
 try:
     import pdfplumber
     PDFPLUMBER_AVAILABLE = True
@@ -51,7 +62,7 @@ def check_poppler_installation():
 
     # 2. If direct check fails, search common paths and test 'pdfinfo -v'
     common_paths = [
-        r"C:\Users\Cirilo\Downloads\Release-24.08.0-0\poppler-24.08.0\Library\bin", # Custom path first
+        r"C:\Poppler\poppler-24.08.0\Library\bin", # Custom path first
         r"C:\Program Files\poppler\bin",
         r"C:\Program Files (x86)\poppler\bin",
         r"C:\poppler\bin",
